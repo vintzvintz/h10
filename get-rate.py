@@ -7,16 +7,17 @@ from logging import warning, info, debug
 from gi.repository import GLib
 
 class DeviceNotFound (Exception): pass
+class DeviceConnexionError (Exception): pass
 
 # Setup of device specific values
-DEVICE_ADDR= 'DF:72:CE:8D:FC:CC'
+#DEVICE_ADDR= 'DF:72:CE:8D:FC:CC'
 HRM_service_uuid = "0000180d-0000-1000-8000-00805f9b34fb"
 HRM_characteristic_uuid = "00002a37-0000-1000-8000-00805f9b34fb"
 
 # DBus object paths
 BLUEZ_SERVICE = 'org.bluez'
 ADAPTER_PATH = '/org/bluez/hci0'
-DEVICE_PATH = f"{ADAPTER_PATH}/dev_{DEVICE_ADDR.replace(':', '_')}"
+#DEVICE_PATH = f"{ADAPTER_PATH}/dev_{DEVICE_ADDR.replace(':', '_')}"
 
 def as_uint( bytelist ):
     val=0
@@ -76,35 +77,62 @@ class HeartRateLoop():
         self.adapter = self.bus.get( BLUEZ_SERVICE, ADAPTER_PATH ) 
 
 
-    def get_device( self, retry, discovery_delay ):
-        """ Get HR sensor device as a dbus proxy object """
-        dev = None
+    def get_device( self, uuid, retry, discovery_delay ):
+        """ Get HR sensor device as a dbus proxy object 
+        retry = -1 for infinite discovery"""
+
         try:
-            dev = self.bus.get( BLUEZ_SERVICE, DEVICE_PATH)
+            path = self.get_device_path( uuid )
+            if( path ):
+                dev = self.bus.get( BLUEZ_SERVICE, path )
+            else:
+                dev = None
         except (AttributeError, KeyError) :
-            debug( "Device not found : %s" % DEVICE_PATH)
             if (retry == 0 ):
-                raise DeviceNotFound( "Device not found at path %s " % DEVICE_PATH )
+                raise DeviceNotFound( "No device found with service UUID %s " % uuid )
 
         if( dev ):
-            info("Device found : %s" % DEVICE_PATH)
+            info("Device found : %s" % path)
+            self.device_path = path
             return dev 
         else :
-            assert( retry > 0)
             debug( "Starting bluetooth discovery for %d seconds" % discovery_delay )
             self.adapter.StartDiscovery()
             time.sleep(discovery_delay)
             self.adapter.StopDiscovery()
             debug( "Stopped discovery")
-            return self.get_device( retry-1, discovery_delay )
+            return self.get_device( uuid, max( -1, retry-1) , discovery_delay )
+
+    def connect_device( self, retry ):
+        while( not self.device.Connected ):
+            try:
+                retry -= 1
+                self.device.Connect()
+                debug( "Connected to %s" % self.device.Name)
+            except Exception as e:
+                debug( str(e) )
+                if( retry > 0):
+                    # disconnect/reconnect sometimes necessary
+                    self.device.Disconnect()
+                    debug("Retry...")
+                else :
+                    raise DeviceConnexionError( "Erreur de connexion à %s" % self.device.Name)
+
+    def get_device_path( self, uuid ):
+        """Look up DBus path for device with UUID in its announced services"""
+        objs = self.mngr.GetManagedObjects()
+        for path in objs:
+            srv_uuids = objs[path].get('org.bluez.Device1', {}).get('UUIDs')
+            if( srv_uuids and uuid.casefold() in srv_uuids ):
+                return path
 
 
-    def get_hrm_path( self, uuid ):
+    def get_characteristic_path( self, uuid ):
         """Look up DBus path for characteristic UUID"""
         objs = self.mngr.GetManagedObjects()
         for path in objs:
             chr_uuid = objs[path].get('org.bluez.GattCharacteristic1', {}).get('UUID')
-            if path.startswith(DEVICE_PATH) and chr_uuid == uuid.casefold():
+            if path.startswith(self.device_path) and chr_uuid == uuid.casefold():
                 return path
 
     @classmethod
@@ -120,15 +148,15 @@ class HeartRateLoop():
 
 
     def start( self ):
-        self.device = self.get_device( retry = 2, discovery_delay = 5 ) 
-        self.device.Connect()
+        self.device = self.get_device( uuid = HRM_service_uuid, retry = 2, discovery_delay = 5 )         
+        self.connect_device(retry=2)
 
         # TODO : handle connection failure
         # TODO : add a timeout on ServicesResolved
-        while not self.device.ServicesResolved:
+        while not self.device.ServicesResolved and self.device.Connected :
             time.sleep(0.5)
 
-        hrm_path = self.get_hrm_path( uuid=HRM_characteristic_uuid)
+        hrm_path = self.get_characteristic_path( uuid=HRM_characteristic_uuid)
         # TODO : handle when hrm characteristic is not found
 
         hrm = self.bus.get( BLUEZ_SERVICE, hrm_path )
